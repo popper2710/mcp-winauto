@@ -2,11 +2,43 @@
 
 from __future__ import annotations
 
+import ctypes
+import ctypes.wintypes
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 from pywinauto import Application
+
+
+def _get_window_rects(hwnd: int):
+    """Return (full_rect, visible_rect) for the given window handle.
+
+    full_rect: from GetWindowRect (includes DWM shadow/extended frame).
+    visible_rect: from DwmGetWindowAttribute DWMWA_EXTENDED_FRAME_BOUNDS
+                   (the actual visible area without shadow).
+
+    Both are (left, top, right, bottom) in screen coordinates.
+    Returns (full_rect, None) if the DWM call fails.
+    """
+    hwnd_c = ctypes.wintypes.HWND(hwnd)
+
+    full = ctypes.wintypes.RECT()
+    ctypes.windll.user32.GetWindowRect(hwnd_c, ctypes.byref(full))
+    full_rect = (full.left, full.top, full.right, full.bottom)
+
+    vis = ctypes.wintypes.RECT()
+    DWMWA_EXTENDED_FRAME_BOUNDS = 9
+    hr = ctypes.windll.dwmapi.DwmGetWindowAttribute(
+        hwnd_c,
+        ctypes.wintypes.DWORD(DWMWA_EXTENDED_FRAME_BOUNDS),
+        ctypes.byref(vis),
+        ctypes.sizeof(vis),
+    )
+    if hr == 0:  # S_OK
+        vis_rect = (vis.left, vis.top, vis.right, vis.bottom)
+        return full_rect, vis_rect
+    return full_rect, None
 
 # Timeout (seconds) for UIA operations that may block (e.g. invoke on
 # a button that opens a modal dialog).
@@ -530,6 +562,31 @@ class WindowManager:
             win.set_focus()
             time.sleep(0.3)
             image = win.capture_as_image()
+
+            # Crop out DWM shadow / extended frame
+            hwnd = win.element_info.handle
+            if hwnd:
+                full_rect, vis_rect = _get_window_rects(hwnd)
+                if vis_rect is not None:
+                    # Offsets in screen coordinates
+                    left_off = vis_rect[0] - full_rect[0]
+                    top_off = vis_rect[1] - full_rect[1]
+                    right_off = full_rect[2] - vis_rect[2]
+                    bottom_off = full_rect[3] - vis_rect[3]
+                    if left_off > 0 or top_off > 0 or right_off > 0 or bottom_off > 0:
+                        img_w, img_h = image.size
+                        screen_w = full_rect[2] - full_rect[0]
+                        screen_h = full_rect[3] - full_rect[1]
+                        # Account for DPI scaling between screen coords and image pixels
+                        scale_x = img_w / screen_w if screen_w else 1
+                        scale_y = img_h / screen_h if screen_h else 1
+                        image = image.crop((
+                            round(left_off * scale_x),
+                            round(top_off * scale_y),
+                            img_w - round(right_off * scale_x),
+                            img_h - round(bottom_off * scale_y),
+                        ))
+
             image.save(save_path)
         except Exception as exc:
             raise RuntimeError(f"Cannot save screenshot: {exc}") from exc
