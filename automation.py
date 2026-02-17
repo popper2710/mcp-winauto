@@ -182,73 +182,126 @@ class WindowManager:
         self._app: Application | None = None
         self._window = None
         self._main_handle = None
+        self._target_handle: int | None = None
 
     # ------------------------------------------------------------------
-    # Dialog detection
+    # Window enumeration (Win32)
     # ------------------------------------------------------------------
 
-    def _find_dialog(self):
-        """Return a Win32 dialog wrapper if one exists, else None.
+    def _enum_process_windows(self) -> list[tuple[int, str]]:
+        """Return ``[(hwnd, title), ...]`` for all visible top-level windows
+        belonging to the connected process.
 
-        Uses Win32 EnumWindows to find visible top-level windows belonging
-        to the connected process whose handle differs from the main window.
-        Returns a _Win32ElementWrapper which uses only Win32 APIs (no COM/UIA)
-        to avoid COMError when a worker thread is stuck in a modal dialog.
+        Uses Win32 EnumWindows so it works even when UIA/COM is blocked by
+        a modal dialog.
         """
-        if self._app is None or self._main_handle is None:
-            return None
+        if self._app is None:
+            return []
 
         pid = self._app.process
-        dialog_hwnd = None
+        results: list[tuple[int, str]] = []
 
         @ctypes.WINFUNCTYPE(
             ctypes.wintypes.BOOL,
             ctypes.wintypes.HWND,
             ctypes.wintypes.LPARAM,
         )
-        def _enum_callback(hwnd, _lparam):
-            nonlocal dialog_hwnd
+        def _cb(hwnd, _lp):
             proc_id = ctypes.wintypes.DWORD()
             _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(proc_id))
-            if proc_id.value == pid:
-                if hwnd != self._main_handle and _user32.IsWindowVisible(hwnd):
-                    dialog_hwnd = hwnd
-                    return False
+            if proc_id.value == pid and _user32.IsWindowVisible(hwnd):
+                buf = ctypes.create_unicode_buffer(256)
+                _user32.GetWindowTextW(hwnd, buf, 256)
+                results.append((hwnd, buf.value))
             return True
 
         try:
-            _user32.EnumWindows(_enum_callback, 0)
+            _user32.EnumWindows(_cb, 0)
         except Exception:
+            pass
+        return results
+
+    # ------------------------------------------------------------------
+    # Dialog detection
+    # ------------------------------------------------------------------
+
+    def _find_dialog(self):
+        """Return a Win32 dialog wrapper if a modal dialog exists, else None.
+
+        A modal dialog is detected when the main window is **disabled**
+        (IsWindowEnabled returns False) and another visible top-level
+        window exists in the same process.
+
+        Returns a _Win32ElementWrapper which uses only Win32 APIs (no
+        COM/UIA) to avoid COMError when a worker thread is stuck.
+        """
+        if self._app is None or self._main_handle is None:
             return None
 
-        if dialog_hwnd is None:
+        # Only detect when main window is disabled (modal dialog blocks it).
+        if _user32.IsWindowEnabled(self._main_handle):
             return None
 
-        return _Win32ElementWrapper(dialog_hwnd)
+        for hwnd, _title in self._enum_process_windows():
+            if hwnd != self._main_handle:
+                return _Win32ElementWrapper(hwnd)
+        return None
 
     # ------------------------------------------------------------------
     # Property
     # ------------------------------------------------------------------
 
+    def _resolve_target(self):
+        """Return a pywinauto wrapper for ``_target_handle``.
+
+        Tries ``self._app.windows()`` first (full UIA support including
+        screenshots).  Falls back to ``_Win32ElementWrapper`` when UIA is
+        unavailable (e.g. modal dialog).  Returns *None* if the window
+        no longer exists.
+        """
+        if self._target_handle is None:
+            return None
+        # Try pywinauto UIA wrappers first.
+        try:
+            for w in self._app.windows(visible_only=True):
+                if w.element_info.handle == self._target_handle:
+                    return w
+        except Exception:
+            pass
+        # Fallback: Win32 wrapper (limited but works during modal dialogs).
+        if _user32.IsWindow(self._target_handle):
+            return _Win32ElementWrapper(self._target_handle)
+        return None
+
     @property
     def window(self):
         """Return the current target window wrapper.
 
-        If a dialog window is open (e.g. MessageBox), returns the dialog
-        so that get_ui_tree / find_element / click operate on it
-        transparently.  Otherwise returns the main window.
+        Resolution order:
+        1. Explicit target set via switch_window (pywinauto UIA preferred,
+           Win32 fallback).  Cleared automatically if the window is gone.
+        2. Modal dialog auto-detection (Win32 wrapper).
+        3. Main window (pywinauto UIA wrapper).
 
         Raises RuntimeError if no app is connected or the window is gone.
         """
         if self._app is None or self._window is None:
             raise RuntimeError("No app connected. Call connect_app first.")
 
-        # Check for a dialog window first.
+        # 1. Explicit target.
+        if self._target_handle is not None:
+            target = self._resolve_target()
+            if target is not None:
+                return target
+            # Target window gone -- clear and fall through.
+            self._target_handle = None
+
+        # 2. Modal dialog auto-detection.
         dialog = self._find_dialog()
         if dialog is not None:
             return dialog
 
-        # No dialog -- use the main window.
+        # 3. Main window.
         try:
             if not self._window.exists():
                 raise RuntimeError("Connected window no longer exists.")
@@ -286,11 +339,13 @@ class WindowManager:
             self._app = app
             self._window = app.top_window()
             self._main_handle = self._window.wrapper_object().element_info.handle
+            self._target_handle = None
             return self._window.window_text()
         except Exception as exc:
             self._app = None
             self._window = None
             self._main_handle = None
+            self._target_handle = None
             raise LookupError(
                 f"Could not connect to app matching '{app_name_regex}': {exc}"
             ) from exc
@@ -713,6 +768,91 @@ class WindowManager:
 
         return f"Selected menu: {menu_path}"
 
+    # ------------------------------------------------------------------
+    # Window management
+    # ------------------------------------------------------------------
+
+    def list_windows(self) -> list[dict]:
+        """Return info about all visible top-level windows of the connected app.
+
+        Each entry is a dict with keys: index, title, handle, is_main, is_current.
+        """
+        if self._app is None:
+            raise RuntimeError("No app connected. Call connect_app first.")
+
+        wins = self._enum_process_windows()
+
+        # Determine effective current target handle.
+        if self._target_handle is not None:
+            current_handle = self._target_handle
+        else:
+            dialog = self._find_dialog()
+            if dialog is not None:
+                current_handle = dialog.element_info.handle
+            else:
+                current_handle = self._main_handle
+
+        result = []
+        for i, (hwnd, title) in enumerate(wins):
+            result.append({
+                "index": i,
+                "title": title,
+                "handle": hwnd,
+                "is_main": (hwnd == self._main_handle),
+                "is_current": (hwnd == current_handle),
+            })
+        return result
+
+    def switch_window(self, *, title: str | None = None, index: int | None = None) -> str:
+        """Switch the target window for subsequent operations.
+
+        Exactly one of *title* or *index* must be provided.
+        - title: substring match against window titles (case-insensitive).
+        - index: 0-based index from list_windows output.
+
+        Switching to the main window clears the explicit target and
+        re-enables automatic modal dialog detection.
+
+        Returns the title of the newly targeted window.
+        """
+        if self._app is None:
+            raise RuntimeError("No app connected. Call connect_app first.")
+        if title is None and index is None:
+            raise ValueError("Provide either 'title' or 'index'.")
+        if title is not None and index is not None:
+            raise ValueError("Provide only one of 'title' or 'index', not both.")
+
+        wins = self._enum_process_windows()
+        if not wins:
+            raise RuntimeError("No visible windows found for the connected application.")
+
+        target_hwnd: int | None = None
+        target_title: str = ""
+
+        if index is not None:
+            if index < 0 or index >= len(wins):
+                raise IndexError(f"Window index {index} out of range (0-{len(wins) - 1})")
+            target_hwnd, target_title = wins[index]
+
+        if title is not None:
+            title_lower = title.lower()
+            for hwnd, wtitle in wins:
+                if title_lower in wtitle.lower():
+                    target_hwnd = hwnd
+                    target_title = wtitle
+                    break
+            if target_hwnd is None:
+                available = [t for _, t in wins]
+                raise LookupError(f"No window matching '{title}'. Available: {available}")
+
+        # If switching to the main window, clear explicit target.
+        if target_hwnd == self._main_handle:
+            self._target_handle = None
+        else:
+            self._target_handle = target_hwnd
+
+        return target_title or "(untitled)"
+
     def close_window(self) -> str:
         """Close the connected window and reset internal state."""
         try:
@@ -722,6 +862,7 @@ class WindowManager:
         self._app = None
         self._window = None
         self._main_handle = None
+        self._target_handle = None
         return "Window closed"
 
     def send_keys(self, keys: str) -> str:

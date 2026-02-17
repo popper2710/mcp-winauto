@@ -46,6 +46,8 @@ Add to `claude_desktop_config.json`:
 | `send_keys` | Send keyboard shortcuts to the connected window. |
 | `get_text` | Get the text content of a UI element. |
 | `save_screenshot` | Capture a screenshot of the connected window and save to a file. |
+| `list_windows` | List all visible windows of the connected application. |
+| `switch_window` | Switch which window is the target for all subsequent operations. |
 
 ## Selector Format
 

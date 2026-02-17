@@ -1,6 +1,6 @@
 """MCP server entry point for mcp-winauto.
 
-Exposes 11 tools for Windows desktop application automation via UI Automation.
+Exposes 13 tools for Windows desktop application automation via UI Automation.
 """
 
 import json
@@ -226,6 +226,53 @@ def save_screenshot(filename: str) -> str:
         result = wm.save_screenshot(filename)
         return result
     except RuntimeError as e:
+        return f"Error: {e}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ------------------------------------------------------------------
+# Tool 12: list_windows
+# ------------------------------------------------------------------
+
+@mcp.tool()
+def list_windows() -> str:
+    """List all visible windows of the connected application.
+    Returns window index, title, and which window is the current target.
+    Use switch_window to change the target window."""
+    try:
+        windows = wm.list_windows()
+        if not windows:
+            return "No visible windows found."
+        lines = []
+        for w in windows:
+            markers = []
+            if w["is_main"]:
+                markers.append("main")
+            if w["is_current"]:
+                markers.append("current")
+            suffix = f"  [{', '.join(markers)}]" if markers else ""
+            lines.append(f"  {w['index']}: {w['title']}{suffix}")
+        return "Windows:\n" + "\n".join(lines)
+    except RuntimeError as e:
+        return f"Error: {e}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ------------------------------------------------------------------
+# Tool 13: switch_window
+# ------------------------------------------------------------------
+
+@mcp.tool()
+def switch_window(title: str = None, index: int = None) -> str:
+    """Switch which window is the target for all subsequent operations.
+    Provide either title (substring match) or index (from list_windows).
+    Switching to the main window re-enables automatic dialog detection."""
+    try:
+        new_title = wm.switch_window(title=title, index=index)
+        return f"Switched to: {new_title}"
+    except (ValueError, IndexError, LookupError, RuntimeError) as e:
         return f"Error: {e}"
     except Exception as e:
         return f"Error: {e}"
