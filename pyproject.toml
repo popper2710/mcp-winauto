@@ -1,7 +1,14 @@
 [project]
 name = "mcp-winauto"
 version = "0.1.0"
-description = "Add your description here"
+description = "MCP server for Windows desktop app automation via UI Automation"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "mcp[cli]>=1.0.0",
+    "pywinauto>=0.6.8",
+    "Pillow>=10.0.0",
+]
+
+[project.scripts]
+mcp-winauto = "server:main"
